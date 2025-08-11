@@ -38,33 +38,39 @@ def login_and_continue(page):
             if not target:
                 raise Exception("Login inputs not found on main page or in iframe.")
 
-        # Fill username and password
+        # Fill credentials
         print("[INFO] Filling username...")
         target.fill(sel.USERNAME_INPUT, str(config.RUT))
-
         print("[INFO] Filling password...")
         target.fill(sel.PASSWORD_INPUT, str(config.CLAVE))
 
-        # Click login button
-        print("[INFO] Clicking login button...")
-        if target.query_selector(sel.LOGIN_BUTTON_IMG):
-            target.click(sel.LOGIN_BUTTON_IMG)
-        elif target.query_selector('input[type="submit"]'):
-            target.click('input[type="submit"]')
-        elif target.query_selector('button[type="submit"]'):
-            target.click('button[type="submit"]')
-        else:
-            target.click('button:has-text("Ingresar")')
+        # Click login button and wait for natural redirect
+        print("[INFO] Clicking login button and waiting for redirect...")
+        with page.expect_navigation(wait_until="networkidle", timeout=60000):
+            if target.query_selector(sel.LOGIN_BUTTON_IMG):
+                target.click(sel.LOGIN_BUTTON_IMG)
+            elif target.query_selector('input[type="submit"]'):
+                target.click('input[type="submit"]')
+            elif target.query_selector('button[type="submit"]'):
+                target.click('button[type="submit"]')
+            else:
+                target.click('button:has-text("Ingresar")')
 
-        # Optional Continue button
+        # Debug: print current URL after login
+        current_url = page.url
+        print(f"[DEBUG] Current URL after login: {current_url}")
+
+        # Now wait for Continue button
+        print("[INFO] Waiting for Continue button...")
         try:
-            target.wait_for_selector(sel.CONTINUE_BUTTON, timeout=4000)
+            page.wait_for_selector(sel.CONTINUE_BUTTON, timeout=15000)
             print("[INFO] Clicking Continue...")
-            target.click(sel.CONTINUE_BUTTON)
+            page.click(sel.CONTINUE_BUTTON)
         except TimeoutError:
-            print("[INFO] No Continue button found.")
+            print("[INFO] Continue button not found after login.")
 
-        print("[SUCCESS] Login attempt completed.")
+        print("[SUCCESS] Login process completed naturally.")
+
     except Error as e:
         print("[ERROR] Playwright error:", e)
         traceback.print_exc()
