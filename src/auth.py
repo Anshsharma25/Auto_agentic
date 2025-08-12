@@ -192,3 +192,269 @@ def login_and_continue(page, post_click_wait: int = 5, wait_for_selector: Option
         traceback.print_exc()
         _dump_debug(page)
         raise
+
+# ---------------------------
+# Appended helpers & robust fill + consult functions
+# ---------------------------
+
+def _click_maybe_in_frames(page, selector, timeout=2000):
+    """
+    Try click on main page first; otherwise try frames.
+    """
+    try:
+        page.click(selector, timeout=timeout)
+        return True
+    except Exception:
+        for frame in page.frames:
+            try:
+                frame.click(selector, timeout=timeout)
+                return True
+            except Exception:
+                continue
+    return False
+
+def _find_element_in_page_and_frames(page, selector, timeout=5000):
+    """
+    Return tuple (frame_or_page, element_handle) where frame_or_page is page (main) or a Frame object.
+    Logs where it found the element. Returns (None, None) if not found.
+    """
+    deadline = time.time() + (timeout / 1000)
+    while time.time() < deadline:
+        # main frame (page)
+        try:
+            el = page.query_selector(selector)
+            if el:
+                print(f"[DEBUG] Found selector '{selector}' on main page")
+                return page, el
+        except Exception:
+            pass
+        # child frames
+        try:
+            for frame in page.frames:
+                try:
+                    el = frame.query_selector(selector)
+                    if el:
+                        print(f"[DEBUG] Found selector '{selector}' in frame: {getattr(frame, 'url', '<frame>')}")
+                        return frame, el
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        time.sleep(0.2)
+    print(f"[DEBUG] Selector '{selector}' not found in page or frames within timeout")
+    return None, None
+
+def _set_select_value(frame_or_page, element_handle, value):
+    """
+    Try multiple ways to set select value:
+      1) frame_or_page.select_option
+      2) element_handle.evaluate to set .value and dispatch events + call gx handlers
+      3) click/select + click option fallback
+    Returns True if succeeded.
+    """
+    # 1) try select_option on frame_or_page
+    try:
+        frame_or_page.select_option(sel.SELECT_TIPO_CFE, value)
+        print("[DEBUG] select_option succeeded.")
+        return True
+    except Exception:
+        pass
+
+    # 2) try element_handle.evaluate to set value and dispatch events
+    try:
+        element_handle.evaluate(
+            """(el, val) => {
+                el.value = val;
+                el.dispatchEvent(new Event('input', {bubbles:true}));
+                el.dispatchEvent(new Event('change', {bubbles:true}));
+                el.dispatchEvent(new Event('blur', {bubbles:true}));
+                try { if (window.gx && gx.evt && typeof gx.evt.onchange === 'function') gx.evt.onchange(el); } catch(e){}
+                try { if (window.gx && gx.evt && typeof gx.evt.onblur === 'function') gx.evt.onblur(el); } catch(e){}
+                return true;
+            }""",
+            value
+        )
+        print("[DEBUG] element_handle.evaluate set select value.")
+        return True
+    except Exception as e:
+        print("[DEBUG] element_handle.evaluate for select failed:", e)
+
+    # 3) fallback: click select then try to click option element
+    try:
+        element_handle.click()
+        try:
+            frame_or_page.click(f'{sel.SELECT_TIPO_CFE} >> option[value="{value}"]', timeout=2000)
+            print("[DEBUG] clicked option fallback succeeded.")
+            return True
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+    return False
+
+def _set_input_value_with_fallback(frame_or_page, element_handle, value):
+    """
+    Try to set input value:
+      1) element_handle.evaluate to set .value + dispatch events + run gx.date.valid_date
+      2) typing fallback: click and type char-by-char (for masked inputs)
+    Returns True if succeeded.
+    """
+    # 1) Try evaluate on the element handle
+    try:
+        element_handle.evaluate(
+            """(el, val) => {
+                try { el.focus && el.focus(); } catch(e) {}
+                el.value = val;
+                el.dispatchEvent(new Event('input', {bubbles:true}));
+                el.dispatchEvent(new Event('change', {bubbles:true}));
+                el.dispatchEvent(new Event('blur', {bubbles:true}));
+                try { if (window.gx && gx.evt && typeof gx.evt.onchange === 'function') gx.evt.onchange(el); } catch(e){}
+                try { if (window.gx && gx.date && typeof gx.date.valid_date === 'function') {
+                    try { gx.date.valid_date(el, 10, 'DMY', 0, 24, 'spa', false, 0); } catch(e){}
+                } } catch(e) {}
+                return true;
+            }""",
+            value
+        )
+        print("[DEBUG] element_handle.evaluate set input value.")
+        return True
+    except Exception as e:
+        print("[DEBUG] element_handle.evaluate for input failed:", e)
+
+    # 2) Typing fallback: click element and type char by char
+    try:
+        element_handle.click(timeout=2000)
+        time.sleep(0.2)
+        for ch in value:
+            element_handle.type(ch, delay=80)
+        try:
+            element_handle.evaluate("(el) => { el.dispatchEvent(new Event('blur', {bubbles:true})); }")
+        except Exception:
+            pass
+        print("[DEBUG] typing fallback succeeded for input.")
+        return True
+    except Exception as e:
+        print("[DEBUG] typing fallback failed for input:", e)
+
+    return False
+
+def fill_cfe_and_consult(
+    page,
+    tipo_value: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    wait_after_result: int = 3
+) -> Tuple[object, str]:
+    """
+    After landing on the "Consulta de CFE recibidos" page, set the tipo, dates,
+    and click Consultar. Returns (final_page, final_url).
+    If arguments are None, values are taken from src.config.
+    """
+    try:
+        tipo = tipo_value or getattr(config, "ECF_TIPO", "111")
+        d_from = date_from or getattr(config, "ECF_FROM_DATE", "")
+        d_to = date_to or getattr(config, "ECF_TO_DATE", "")
+
+        print(f"[INFO] fill_cfe_and_consult: tipo={tipo}, desde={d_from}, hasta={d_to}")
+
+        # 1) Set select
+        frame, el = _find_element_in_page_and_frames(page, sel.SELECT_TIPO_CFE, timeout=5000)
+        if el:
+            try:
+                ok = _set_select_value(frame, el, tipo)
+                if ok:
+                    print("[INFO] vFILTIPOCFE set.")
+                else:
+                    print("[WARN] Could not set vFILTIPOCFE by any method.")
+            except Exception as e:
+                print("[ERROR] Exception while setting vFILTIPOCFE:", e)
+        else:
+            print("[WARN] Select vFILTIPOCFE not found - cannot set.")
+
+        # 2) Fill 'desde' input
+        if d_from:
+            frame_from, el_from = _find_element_in_page_and_frames(page, sel.DATE_FROM, timeout=5000)
+            if el_from:
+                ok = _set_input_value_with_fallback(frame_from, el_from, d_from)
+                if ok:
+                    print("[INFO] CTLFECHADESDE set.")
+                else:
+                    print("[WARN] Could not set CTLFECHADESDE by any method.")
+            else:
+                print("[WARN] CTLFECHADESDE not found on page/frames.")
+
+        # 3) Fill 'hasta' input
+        if d_to:
+            frame_to, el_to = _find_element_in_page_and_frames(page, sel.DATE_TO, timeout=5000)
+            if el_to:
+                ok = _set_input_value_with_fallback(frame_to, el_to, d_to)
+                if ok:
+                    print("[INFO] CTLFECHAHASTA set.")
+                else:
+                    print("[WARN] Could not set CTLFECHAHASTA by any method.")
+            else:
+                print("[WARN] CTLFECHAHASTA not found on page/frames.")
+
+        # small pause for client-side processing
+        time.sleep(0.5)
+
+        # 4) Click Consultar and wait for navigation/results
+        print("[INFO] Clicking Consultar...")
+        final_page = page
+        final_url = page.url
+
+        try:
+            # prefer same-page navigation
+            with page.expect_navigation(timeout=30000):
+                clicked = _click_maybe_in_frames(page, sel.BUTTON_CONSULTAR)
+                if not clicked:
+                    raise Exception("Could not click Consultar (no element found).")
+            final_page = page
+            final_url = page.url
+            print("[INFO] Navigation after Consultar done. URL:", final_url)
+        except Exception:
+            # maybe opens new tab
+            try:
+                with page.context.expect_page(timeout=5000) as new_page_ctx:
+                    clicked = _click_maybe_in_frames(page, sel.BUTTON_CONSULTAR)
+                    if not clicked:
+                        raise Exception("Could not click Consultar (no element found).")
+                new_page = new_page_ctx.value
+                try:
+                    new_page.wait_for_load_state("load", timeout=30000)
+                except Exception:
+                    try:
+                        new_page.wait_for_load_state("networkidle", timeout=30000)
+                    except Exception:
+                        pass
+                final_page = new_page
+                final_url = new_page.url
+                print("[INFO] Consultar opened new tab. URL:", final_url)
+            except Exception:
+                # final fallback: click and wait networkidle on same page
+                clicked_any = _click_maybe_in_frames(page, sel.BUTTON_CONSULTAR)
+                if not clicked_any:
+                    print("[ERROR] Could not click Consultar anywhere. Dumping debug.")
+                    _dump_debug(page)
+                    return page, page.url
+                try:
+                    page.wait_for_load_state("networkidle", timeout=30000)
+                except Exception:
+                    pass
+                final_page = page
+                final_url = page.url
+                print("[INFO] After fallback click, URL:", final_url)
+
+        # optional hold for final page to settle
+        if wait_after_result and wait_after_result > 0:
+            time.sleep(wait_after_result)
+
+        print("[SUCCESS] fill_cfe_and_consult finished. Final URL:", final_url)
+        return final_page, final_url
+
+    except Exception as e:
+        print("[ERROR] Exception in fill_cfe_and_consult:", e)
+        traceback.print_exc()
+        _dump_debug(page)
+        raise

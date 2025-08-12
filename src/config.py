@@ -1,17 +1,20 @@
 # src/config.py
 import os
-from dotenv import load_dotenv
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
 
-load_dotenv()
+# Credentials
+RUT = os.environ.get("RUT", "")
+CLAVE = os.environ.get("CLAVE", "")
 
-RUT = os.getenv("RUT")
-CLAVE = os.getenv("Clave") or os.getenv("CLAVE") or os.getenv("PASSWORD") or os.getenv("PASS")
-DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "./downloads")
+# CFE filter defaults (DD/MM/YYYY)
+ECF_TIPO = os.environ.get("ECF_TIPO", "111")           # 111 => e-Factura
+ECF_FROM_DATE = os.environ.get("ECF_FROM_DATE", "01/06/2025")
+ECF_TO_DATE = os.environ.get("ECF_TO_DATE", "30/08/2025")
 
-if not RUT or not CLAVE:
-    raise ValueError("Please set RUT and Clave in .env file")
-
-# Example .env file:
-# RUT=213624850018
-# Clave=aa0000aa
-# DOWNLOAD_DIR=./downloads
+# Timeouts (ms)
+GOTO_TIMEOUT = int(os.environ.get("GOTO_TIMEOUT_MS", "120000"))
+LOADSTATE_TIMEOUT = int(os.environ.get("LOADSTATE_TIMEOUT_MS", "60000"))
