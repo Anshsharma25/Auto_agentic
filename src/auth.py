@@ -14,6 +14,67 @@ def _dump_debug(page, prefix="debug"):
     except Exception as e:
         print("[DEBUG] Could not save debug files:", e)
 
+def _wait_for_url_contains(page, substring, timeout=60):
+    """Poll page.url until substring present or timeout. Returns True if found."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            url = page.url
+        except Exception:
+            url = ""
+        if substring in url:
+            return True
+        time.sleep(0.5)
+    return False
+
+def _find_and_click_continue(page, timeout=30):
+    """
+    Try to find the continue button on the main page or inside frames.
+    Returns True if clicked.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        # Try main page
+        try:
+            el = page.query_selector(sel.CONTINUE_BUTTON)
+            if el:
+                try:
+                    el.scroll_into_view_if_needed()
+                except Exception:
+                    pass
+                try:
+                    el.click()
+                    return True
+                except Exception as e:
+                    # maybe not yet clickable
+                    # continue to try frames as well
+                    print("[DEBUG] Found continue on main page but click failed:", e)
+        except Exception:
+            pass
+
+        # Try every frame
+        try:
+            for frame in page.frames:
+                try:
+                    fel = frame.query_selector(sel.CONTINUE_BUTTON)
+                    if fel:
+                        try:
+                            fel.scroll_into_view_if_needed()
+                        except Exception:
+                            pass
+                        try:
+                            fel.click()
+                            return True
+                        except Exception as e:
+                            print("[DEBUG] Found continue in frame but click failed:", e)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        time.sleep(0.5)
+    return False
+
 def login_and_continue(page):
     try:
         print("[INFO] Waiting for page to load (networkidle)...")
@@ -21,7 +82,7 @@ def login_and_continue(page):
 
         target = None
 
-        # Try main-page selectors first
+        # Try main-page selectors first (or fallback to iframe)
         try:
             print("[INFO] Checking for main-page username input...")
             page.wait_for_selector(sel.USERNAME_INPUT, timeout=8000)
@@ -44,32 +105,45 @@ def login_and_continue(page):
         print("[INFO] Filling password...")
         target.fill(sel.PASSWORD_INPUT, str(config.CLAVE))
 
-        # Click login button and wait for natural redirect
-        print("[INFO] Clicking login button and waiting for redirect...")
-        with page.expect_navigation(wait_until="networkidle", timeout=60000):
-            if target.query_selector(sel.LOGIN_BUTTON_IMG):
-                target.click(sel.LOGIN_BUTTON_IMG)
-            elif target.query_selector('input[type="submit"]'):
-                target.click('input[type="submit"]')
-            elif target.query_selector('button[type="submit"]'):
-                target.click('button[type="submit"]')
-            else:
-                target.click('button:has-text("Ingresar")')
+        # Click login button (avoid expect_navigation to prevent hanging)
+        print("[INFO] Clicking login button...")
+        if target.query_selector(sel.LOGIN_BUTTON_IMG):
+            target.click(sel.LOGIN_BUTTON_IMG)
+        elif target.query_selector('input[type="submit"]'):
+            target.click('input[type="submit"]')
+        elif target.query_selector('button[type="submit"]'):
+            target.click('button[type="submit"]')
+        else:
+            target.click('button:has-text("Ingresar")')
 
-        # Debug: print current URL after login
+        # Wait (poll) until we reach the selecciona-entidad URL (or timeout)
+        print("[INFO] Waiting for selecciona-entidad URL (up to 60s)...")
+        reached = _wait_for_url_contains(page, "selecciona-entidad", timeout=60)
         current_url = page.url
         print(f"[DEBUG] Current URL after login: {current_url}")
 
-        # Now wait for Continue button
-        print("[INFO] Waiting for Continue button...")
-        try:
-            page.wait_for_selector(sel.CONTINUE_BUTTON, timeout=15000)
-            print("[INFO] Clicking Continue...")
-            page.click(sel.CONTINUE_BUTTON)
-        except TimeoutError:
-            print("[INFO] Continue button not found after login.")
+        if not reached:
+            print("[WARN] Did not detect 'selecciona-entidad' in URL within timeout. Will still try to find Continue button on current page(s).")
 
-        print("[SUCCESS] Login process completed naturally.")
+        # Try to find and click the Continue button (search main page and iframes)
+        print("[INFO] Looking for Continue button (up to 30s)...")
+        clicked = _find_and_click_continue(page, timeout=30)
+        if clicked:
+            # Wait for next page to load after clicking Continue
+            try:
+                page.wait_for_load_state("networkidle", timeout=30000)
+            except Exception:
+                # fallback to DOMContentLoaded
+                try:
+                    page.wait_for_load_state("domcontentloaded", timeout=15000)
+                except Exception:
+                    pass
+            print(f"[DEBUG] Continue clicked, current URL: {page.url}")
+        else:
+            print("[WARN] Could not find or click the Continue button within timeout.")
+            _dump_debug(page)
+
+        print("[SUCCESS] Login + Continue attempt finished.")
 
     except Error as e:
         print("[ERROR] Playwright error:", e)
