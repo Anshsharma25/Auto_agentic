@@ -1,6 +1,8 @@
+# src/auth.py
 import time
 import traceback
 from typing import Optional, Tuple
+from pathlib import Path
 from playwright.sync_api import TimeoutError, Error
 from src import selectors as sel
 from src import config
@@ -57,6 +59,38 @@ def _find_continue_element(page, timeout=30):
             pass
         time.sleep(0.5)
     return None
+
+# NEW helper: busca <a> por texto en page y frames
+def _find_link_in_page_and_frames(page, link_text: str, timeout: int = 15) -> Tuple[Optional[object], Optional[object]]:
+    """
+    Busca un <a> que contenga link_text (texto parcial) en la página principal y en todos los frames.
+    timeout: segundos totales para buscar.
+    Retorna (frame_or_page, element_handle) o (None, None) si no lo encuentra.
+    """
+    deadline = time.time() + timeout
+    xpath = f'xpath=//a[contains(normalize-space(.), "{link_text}")]'
+    while time.time() < deadline:
+        try:
+            el = page.query_selector(xpath)
+            if el:
+                print(f"[DEBUG] Found link '{link_text}' on main page")
+                return page, el
+        except Exception:
+            pass
+        try:
+            for frame in page.frames:
+                try:
+                    el = frame.query_selector(xpath)
+                    if el:
+                        print(f"[DEBUG] Found link '{link_text}' in frame: {getattr(frame, 'url', '<frame>')}")
+                        return frame, el
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        time.sleep(0.2)
+    print(f"[DEBUG] Link '{link_text}' not found in page or frames within timeout")
+    return None, None
 
 def login_and_continue(page, post_click_wait: int = 5, wait_for_selector: Optional[str] = None) -> Tuple[object, str]:
     """
@@ -170,14 +204,61 @@ def login_and_continue(page, post_click_wait: int = 5, wait_for_selector: Option
 
         # Now click on "Consulta de CFE recibidos" link and wait for navigation
         print("[INFO] Clicking 'Consulta de CFE recibidos' link...")
-        with final_page.expect_navigation(timeout=30000):
-            final_page.click('text="Consulta de CFE recibidos"')
-        final_url = final_page.url
-        print(f"[INFO] Landed on page after clicking 'Consulta de CFE recibidos': {final_url}")
 
-        # Optionally wait here again or sleep if needed
-        time.sleep(3)  # wait 3 seconds on this new page
+        # find the link in page or frames
+        frame_or_page, link_el = _find_link_in_page_and_frames(final_page, "Consulta de CFE recibidos", timeout=15)
+        if not link_el:
+            print("[ERROR] 'Consulta de CFE recibidos' link not found. Dumping debug and returning current page.")
+            _dump_debug(final_page)
+            return final_page, final_url
 
+        # identify the Page object that should observe navigation
+        navigation_page = getattr(frame_or_page, "page", frame_or_page)
+
+        try:
+            with navigation_page.expect_navigation(timeout=30000):
+                try:
+                    link_el.click()
+                except Exception:
+                    link_el.evaluate("el => el.click()")
+            final_page = navigation_page
+            final_url = navigation_page.url
+            print(f"[INFO] Navigation after clicking link detected. URL: {final_url}")
+        except TimeoutError:
+            try:
+                with page.context.expect_page(timeout=5000) as new_page_ctx:
+                    try:
+                        link_el.click()
+                    except Exception:
+                        link_el.evaluate("el => el.click()")
+                new_page = new_page_ctx.value
+                try:
+                    new_page.wait_for_load_state("load", timeout=30000)
+                except Exception:
+                    try:
+                        new_page.wait_for_load_state("networkidle", timeout=30000)
+                    except Exception:
+                        pass
+                final_page = new_page
+                final_url = new_page.url
+                print(f"[INFO] Link opened in a new tab. URL: {final_url}")
+            except Exception:
+                try:
+                    try:
+                        link_el.click()
+                    except Exception:
+                        link_el.evaluate("el => el.click()")
+                except Exception as e:
+                    print("[WARN] click on link failed:", e)
+                try:
+                    navigation_page.wait_for_load_state("networkidle", timeout=10000)
+                except Exception:
+                    pass
+                final_page = navigation_page
+                final_url = navigation_page.url
+                print(f"[INFO] After fallback click, URL: {final_url}")
+
+        time.sleep(3)
         print("[SUCCESS] Navigation complete. Ready on final page.")
         return final_page, final_url
 
@@ -197,9 +278,6 @@ def login_and_continue(page, post_click_wait: int = 5, wait_for_selector: Option
 # ---------------------------
 
 def _click_maybe_in_frames(page, selector, timeout=2000):
-    """
-    Try click on main page first; otherwise try frames.
-    """
     try:
         page.click(selector, timeout=timeout)
         return True
@@ -213,13 +291,8 @@ def _click_maybe_in_frames(page, selector, timeout=2000):
     return False
 
 def _find_element_in_page_and_frames(page, selector, timeout=5000):
-    """
-    Return tuple (frame_or_page, element_handle) where frame_or_page is page (main) or a Frame object.
-    Logs where it found the element. Returns (None, None) if not found.
-    """
     deadline = time.time() + (timeout / 1000)
     while time.time() < deadline:
-        # main frame (page)
         try:
             el = page.query_selector(selector)
             if el:
@@ -227,7 +300,6 @@ def _find_element_in_page_and_frames(page, selector, timeout=5000):
                 return page, el
         except Exception:
             pass
-        # child frames
         try:
             for frame in page.frames:
                 try:
@@ -244,14 +316,6 @@ def _find_element_in_page_and_frames(page, selector, timeout=5000):
     return None, None
 
 def _set_select_value(frame_or_page, element_handle, value):
-    """
-    Try multiple ways to set select value:
-      1) frame_or_page.select_option
-      2) element_handle.evaluate to set .value and dispatch events + call gx handlers
-      3) click/select + click option fallback
-    Returns True if succeeded.
-    """
-    # 1) try select_option on frame_or_page
     try:
         frame_or_page.select_option(sel.SELECT_TIPO_CFE, value)
         print("[DEBUG] select_option succeeded.")
@@ -259,7 +323,6 @@ def _set_select_value(frame_or_page, element_handle, value):
     except Exception:
         pass
 
-    # 2) try element_handle.evaluate to set value and dispatch events
     try:
         element_handle.evaluate(
             """(el, val) => {
@@ -278,7 +341,6 @@ def _set_select_value(frame_or_page, element_handle, value):
     except Exception as e:
         print("[DEBUG] element_handle.evaluate for select failed:", e)
 
-    # 3) fallback: click select then try to click option element
     try:
         element_handle.click()
         try:
@@ -293,13 +355,6 @@ def _set_select_value(frame_or_page, element_handle, value):
     return False
 
 def _set_input_value_with_fallback(frame_or_page, element_handle, value):
-    """
-    Try to set input value:
-      1) element_handle.evaluate to set .value + dispatch events + run gx.date.valid_date
-      2) typing fallback: click and type char-by-char (for masked inputs)
-    Returns True if succeeded.
-    """
-    # 1) Try evaluate on the element handle
     try:
         element_handle.evaluate(
             """(el, val) => {
@@ -321,7 +376,6 @@ def _set_input_value_with_fallback(frame_or_page, element_handle, value):
     except Exception as e:
         print("[DEBUG] element_handle.evaluate for input failed:", e)
 
-    # 2) Typing fallback: click element and type char by char
     try:
         element_handle.click(timeout=2000)
         time.sleep(0.2)
@@ -345,11 +399,6 @@ def fill_cfe_and_consult(
     date_to: Optional[str] = None,
     wait_after_result: int = 3
 ) -> Tuple[object, str]:
-    """
-    After landing on the "Consulta de CFE recibidos" page, set the tipo, dates,
-    and click Consultar. Returns (final_page, final_url).
-    If arguments are None, values are taken from src.config.
-    """
     try:
         tipo = tipo_value or getattr(config, "ECF_TIPO", "111")
         d_from = date_from or getattr(config, "ECF_FROM_DATE", "")
@@ -357,7 +406,6 @@ def fill_cfe_and_consult(
 
         print(f"[INFO] fill_cfe_and_consult: tipo={tipo}, desde={d_from}, hasta={d_to}")
 
-        # 1) Set select
         frame, el = _find_element_in_page_and_frames(page, sel.SELECT_TIPO_CFE, timeout=5000)
         if el:
             try:
@@ -371,7 +419,6 @@ def fill_cfe_and_consult(
         else:
             print("[WARN] Select vFILTIPOCFE not found - cannot set.")
 
-        # 2) Fill 'desde' input
         if d_from:
             frame_from, el_from = _find_element_in_page_and_frames(page, sel.DATE_FROM, timeout=5000)
             if el_from:
@@ -383,7 +430,6 @@ def fill_cfe_and_consult(
             else:
                 print("[WARN] CTLFECHADESDE not found on page/frames.")
 
-        # 3) Fill 'hasta' input
         if d_to:
             frame_to, el_to = _find_element_in_page_and_frames(page, sel.DATE_TO, timeout=5000)
             if el_to:
@@ -395,16 +441,13 @@ def fill_cfe_and_consult(
             else:
                 print("[WARN] CTLFECHAHASTA not found on page/frames.")
 
-        # small pause for client-side processing
         time.sleep(0.5)
 
-        # 4) Click Consultar and wait for navigation/results
         print("[INFO] Clicking Consultar...")
         final_page = page
         final_url = page.url
 
         try:
-            # prefer same-page navigation
             with page.expect_navigation(timeout=30000):
                 clicked = _click_maybe_in_frames(page, sel.BUTTON_CONSULTAR)
                 if not clicked:
@@ -413,7 +456,6 @@ def fill_cfe_and_consult(
             final_url = page.url
             print("[INFO] Navigation after Consultar done. URL:", final_url)
         except Exception:
-            # maybe opens new tab
             try:
                 with page.context.expect_page(timeout=5000) as new_page_ctx:
                     clicked = _click_maybe_in_frames(page, sel.BUTTON_CONSULTAR)
@@ -431,7 +473,6 @@ def fill_cfe_and_consult(
                 final_url = new_page.url
                 print("[INFO] Consultar opened new tab. URL:", final_url)
             except Exception:
-                # final fallback: click and wait networkidle on same page
                 clicked_any = _click_maybe_in_frames(page, sel.BUTTON_CONSULTAR)
                 if not clicked_any:
                     print("[ERROR] Could not click Consultar anywhere. Dumping debug.")
@@ -445,7 +486,6 @@ def fill_cfe_and_consult(
                 final_url = page.url
                 print("[INFO] After fallback click, URL:", final_url)
 
-        # optional hold for final page to settle
         if wait_after_result and wait_after_result > 0:
             time.sleep(wait_after_result)
 
@@ -458,20 +498,11 @@ def fill_cfe_and_consult(
         _dump_debug(page)
         raise
 
-# ---------------------------
-# New helper: click the image link inside iframe and open
-# ---------------------------
 def click_iframe_image_and_open(page, wait_seconds: int = 5):
-    """
-    Find an iframe whose src contains 'efacConsultasMenuServFE', switch to it,
-    find the anchor/image link, click it, and return the opened page (new tab)
-    or the same page if navigation happened in-place.
-    """
     try:
         print("[INFO] Looking for efacConsultasMenuServFE iframe...")
         iframe_el = page.query_selector('iframe[src*="efacConsultasMenuServFE"]') or page.query_selector('iframe[id^="gxpea"]')
         if not iframe_el:
-            # fallback: try ANY iframe and inspect urls
             for f in page.query_selector_all("iframe"):
                 src = f.get_attribute("src") or ""
                 if "efacConsultasMenuServFE" in src or "efacconsmnuservredireccion" in src:
@@ -491,23 +522,20 @@ def click_iframe_image_and_open(page, wait_seconds: int = 5):
 
         print("[INFO] Got content frame. Looking for image/link inside frame...")
 
-        # Try multiple selectors in order of likelihood
         selectors_to_try = [
             'a[href*="efacconsultatwebsobrecfe"]',
             'a:has(img[src*="K2BActionDisplay.gif"])',
             'a:has(img[id^="vCOLDISPLAY"])',
-            'img[src*="K2BActionDisplay.gif"]',  # will click parent anchor if needed
+            'img[src*="K2BActionDisplay.gif"]',
             'img[id^="vCOLDISPLAY"]'
         ]
 
         anchor = None
         for selq in selectors_to_try:
             try:
-                # If selector selects an <img>, find its closest <a>
                 el = frame.query_selector(selq)
                 if el:
                     if el.evaluate("el => el.tagName.toLowerCase()") == "img":
-                        # find parent anchor
                         try:
                             parent = el.evaluate_handle("img => img.closest('a')")
                             if parent:
@@ -527,7 +555,6 @@ def click_iframe_image_and_open(page, wait_seconds: int = 5):
             _dump_debug(page)
             return None
 
-        # Try clicking and detect whether it opens a new tab or navigates same page
         print("[INFO] Clicking the link inside iframe...")
         try:
             with page.context.expect_page(timeout=10000) as new_page_ctx:
@@ -543,12 +570,10 @@ def click_iframe_image_and_open(page, wait_seconds: int = 5):
             print("[SUCCESS] Link opened in a new tab:", new_page.url)
             return new_page
         except TimeoutError:
-            # No new tab — maybe same-frame navigation
             try:
                 anchor.click()
             except Exception as e:
                 print("[WARN] click without new tab failed:", e)
-            # give it some time to navigate or load content
             try:
                 frame.wait_for_load_state("load", timeout=10000)
             except Exception:
@@ -557,7 +582,6 @@ def click_iframe_image_and_open(page, wait_seconds: int = 5):
                 except Exception:
                     pass
             print("[INFO] Clicked link — no new tab detected. Current page URL:", page.url)
-            # keep page visible for debugging/inspection
             time.sleep(wait_seconds)
             return page
 
@@ -566,3 +590,60 @@ def click_iframe_image_and_open(page, wait_seconds: int = 5):
         traceback.print_exc()
         _dump_debug(page)
         raise
+
+def export_xls_and_save(page, save_dir="downloads", timeout=30000):
+    """
+    Find and click the EXPORTXLS element (searching page and frames),
+    wait for the download and save it into save_dir. Returns saved filepath or None.
+    """
+    try:
+        selectors = [
+            sel.EXPORT_XLS_BY_NAME,
+            sel.EXPORT_XLS_BY_ID,
+            sel.EXPORT_XLS_IMG,
+            'input[name="EXPORTXLS"]',
+            'input#EXPORTXLS'
+        ]
+
+        frame_or_page = None
+        el = None
+        for s in selectors:
+            frame_or_page, el = _find_element_in_page_and_frames(page, s, timeout=2000)
+            if el:
+                print(f"[DEBUG] Found export element using selector: {s}")
+                break
+
+        if not el:
+            print("[ERROR] Export element not found with known selectors. Dumping debug.")
+            _dump_debug(page)
+            return None
+
+        download_listen_page = getattr(frame_or_page, "page", frame_or_page)
+
+        print("[INFO] Clicking export element and waiting for download...")
+        with download_listen_page.expect_download(timeout=timeout) as download_ctx:
+            try:
+                el.click()
+            except Exception:
+                try:
+                    el.evaluate("el => el.click()")
+                except Exception as e:
+                    print("[ERROR] Could not click export element:", e)
+                    return None
+
+        download = download_ctx.value
+        suggested = download.suggested_filename or "export.xls"
+        Path(save_dir).mkdir(parents=True, exist_ok=True)
+        dest = Path(save_dir) / suggested
+        download.save_as(str(dest))
+        print(f"[SUCCESS] Download saved to: {dest}")
+        return str(dest)
+
+    except Exception as e:
+        print("[ERROR] Exception during export_xls_and_save:", e)
+        traceback.print_exc()
+        try:
+            _dump_debug(page)
+        except Exception:
+            pass
+        return None
