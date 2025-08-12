@@ -1,4 +1,3 @@
-# src/auth.py
 import time
 import traceback
 from typing import Optional, Tuple
@@ -455,6 +454,115 @@ def fill_cfe_and_consult(
 
     except Exception as e:
         print("[ERROR] Exception in fill_cfe_and_consult:", e)
+        traceback.print_exc()
+        _dump_debug(page)
+        raise
+
+# ---------------------------
+# New helper: click the image link inside iframe and open
+# ---------------------------
+def click_iframe_image_and_open(page, wait_seconds: int = 5):
+    """
+    Find an iframe whose src contains 'efacConsultasMenuServFE', switch to it,
+    find the anchor/image link, click it, and return the opened page (new tab)
+    or the same page if navigation happened in-place.
+    """
+    try:
+        print("[INFO] Looking for efacConsultasMenuServFE iframe...")
+        iframe_el = page.query_selector('iframe[src*="efacConsultasMenuServFE"]') or page.query_selector('iframe[id^="gxpea"]')
+        if not iframe_el:
+            # fallback: try ANY iframe and inspect urls
+            for f in page.query_selector_all("iframe"):
+                src = f.get_attribute("src") or ""
+                if "efacConsultasMenuServFE" in src or "efacconsmnuservredireccion" in src:
+                    iframe_el = f
+                    break
+
+        if not iframe_el:
+            print("[ERROR] Target iframe not found on the page.")
+            _dump_debug(page)
+            return None
+
+        frame = iframe_el.content_frame()
+        if not frame:
+            print("[ERROR] Could not access iframe content frame.")
+            _dump_debug(page)
+            return None
+
+        print("[INFO] Got content frame. Looking for image/link inside frame...")
+
+        # Try multiple selectors in order of likelihood
+        selectors_to_try = [
+            'a[href*="efacconsultatwebsobrecfe"]',
+            'a:has(img[src*="K2BActionDisplay.gif"])',
+            'a:has(img[id^="vCOLDISPLAY"])',
+            'img[src*="K2BActionDisplay.gif"]',  # will click parent anchor if needed
+            'img[id^="vCOLDISPLAY"]'
+        ]
+
+        anchor = None
+        for selq in selectors_to_try:
+            try:
+                # If selector selects an <img>, find its closest <a>
+                el = frame.query_selector(selq)
+                if el:
+                    if el.evaluate("el => el.tagName.toLowerCase()") == "img":
+                        # find parent anchor
+                        try:
+                            parent = el.evaluate_handle("img => img.closest('a')")
+                            if parent:
+                                anchor = parent.as_element()
+                        except Exception:
+                            anchor = None
+                    else:
+                        anchor = el
+                if anchor:
+                    print(f"[DEBUG] Found element with selector: {selq}")
+                    break
+            except Exception:
+                continue
+
+        if not anchor:
+            print("[ERROR] Could not find link/image inside iframe with known selectors.")
+            _dump_debug(page)
+            return None
+
+        # Try clicking and detect whether it opens a new tab or navigates same page
+        print("[INFO] Clicking the link inside iframe...")
+        try:
+            with page.context.expect_page(timeout=10000) as new_page_ctx:
+                anchor.click()
+            new_page = new_page_ctx.value
+            try:
+                new_page.wait_for_load_state("load", timeout=20000)
+            except Exception:
+                try:
+                    new_page.wait_for_load_state("networkidle", timeout=20000)
+                except Exception:
+                    pass
+            print("[SUCCESS] Link opened in a new tab:", new_page.url)
+            return new_page
+        except TimeoutError:
+            # No new tab — maybe same-frame navigation
+            try:
+                anchor.click()
+            except Exception as e:
+                print("[WARN] click without new tab failed:", e)
+            # give it some time to navigate or load content
+            try:
+                frame.wait_for_load_state("load", timeout=10000)
+            except Exception:
+                try:
+                    page.wait_for_load_state("networkidle", timeout=10000)
+                except Exception:
+                    pass
+            print("[INFO] Clicked link — no new tab detected. Current page URL:", page.url)
+            # keep page visible for debugging/inspection
+            time.sleep(wait_seconds)
+            return page
+
+    except Exception as e:
+        print("[ERROR] Exception in click_iframe_image_and_open:", e)
         traceback.print_exc()
         _dump_debug(page)
         raise

@@ -7,6 +7,11 @@ from src import config
 START_URL = "https://servicios.dgi.gub.uy/serviciosenlinea"
 
 def main():
+    print("[CONFIG] LOGIN START URL:", START_URL)
+    print("[CONFIG] GOTO_TIMEOUT (ms):", config.GOTO_TIMEOUT)
+    print("[CONFIG] RUT (repr):", repr(config.RUT))
+    print("[CONFIG] CLAVE (repr):", repr(config.CLAVE))
+
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=False)
         context = browser.new_context()
@@ -33,3 +38,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+#python -m src.main
