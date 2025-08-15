@@ -48,10 +48,13 @@ def run(headed: bool = False, pause_on_end: bool = False, devtools: bool = False
             print('[INFO] Reached', final_url)
         except Exception as e:
             print('[ERROR] login_and_continue failed:', e)
-            browser.close()
+            try:
+                browser.close()
+            except Exception:
+                pass
             return
 
-        # Optionally fill the tipo/date and click consultar
+        # Optionally fill the tipo/date and click consultar (keeps behavior as before)
         try:
             final_page, results_url = auth.fill_cfe_and_consult(
                 final_page,
@@ -64,13 +67,38 @@ def run(headed: bool = False, pause_on_end: bool = False, devtools: bool = False
         except Exception as e:
             print('[WARN] fill_cfe_and_consult failed:', e)
 
-        # Collect links from the results grid and extract fields
+        # Collect links from the results grid and extract fields (this now does in-place pagination & saving)
         try:
             link_selector = getattr(sel, "GRID_LINKS_SELECTOR", None)
-            out = auth.collect_cfe_from_links(final_page, link_selector=link_selector, output_file=config.OUTPUT_FILE, parent_selector=getattr(sel, "GRID_PARENT_SELECTOR", None))
+            parent_selector = getattr(sel, "GRID_PARENT_SELECTOR", None)
+            # IMPORTANT: collector now handles pagination itself. do_post_action=False avoids double-navigation.
+            out = auth.collect_cfe_from_links(
+                final_page,
+                link_selector=link_selector,
+                output_file=config.OUTPUT_FILE,
+                parent_selector=parent_selector,
+                do_post_action=False,
+                max_pages=getattr(config, "MAX_PAGES", None)
+            )
             print('[INFO] Extraction saved to:', out)
         except Exception as e:
             print('[ERROR] collect_cfe_from_links failed:', e)
+
+        # --- Optional: after extraction attempt to go back to consulta and click the specific image button ---
+        # (This is optional; collector already did pagination.)
+        try:
+            print('[INFO] Running optional post-extraction: go to consulta and click next-image (W0127SIGUIENTE)...')
+            try:
+                page_after, url_after = auth.go_to_consulta_and_click_next(final_page,
+                                                                           tipo_value=config.ECF_TIPO,
+                                                                           date_from=config.ECF_FROM_DATE,
+                                                                           date_to=config.ECF_TO_DATE,
+                                                                           wait_after_fill=2.0)
+                print('[INFO] Post-action landed on:', url_after)
+            except Exception as e:
+                print('[WARN] go_to_consulta_and_click_next failed:', e)
+        except Exception as e:
+            print('[WARN] Post-extraction step failed unexpectedly:', e)
 
         # If headed and pause requested, open Playwright inspector (page.pause) so you can interact
         if headed and pause_on_end:
@@ -87,7 +115,7 @@ def run(headed: bool = False, pause_on_end: bool = False, devtools: bool = False
             time.sleep(5)
 
         browser.close()
-        print('[INFO] Browser closed. Done.')
+        print('[INFO] Browser closed. Done')
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Run CFE extraction (Playwright).')

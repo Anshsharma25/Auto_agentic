@@ -44,7 +44,6 @@ def _wait_for_url_contains(page, substring, timeout=60):
 # ---------------------------
 # URL helpers & incremental persistence
 # ---------------------------
-
 def _canonicalize_url(url: str) -> str:
     """Normalize a URL for deduplication. Removes fragment, normalizes scheme/netloc casing and strips trailing slash."""
     if not url:
@@ -111,6 +110,7 @@ def login_and_continue(page, post_click_wait: int = 5, wait_for_selector: Option
     """
     Login to the site, press Continue and then click the 'Consulta de CFE recibidos' entry.
     Returns (final_page, final_url).
+    This function is robust and tries frames + fallbacks like the prior version.
     """
     try:
         print("[INFO] Waiting for initial page load (networkidle)...")
@@ -152,7 +152,13 @@ def login_and_continue(page, post_click_wait: int = 5, wait_for_selector: Option
         elif target.query_selector('button[type="submit"]'):
             target.click('button[type="submit"]')
         else:
-            target.click('button:has-text("Ingresar")')
+            try:
+                target.click('button:has-text("Ingresar")')
+            except Exception:
+                try:
+                    target.press(sel.PASSWORD_INPUT, "Enter")
+                except Exception:
+                    pass
 
         print("[INFO] Waiting for 'selecciona-entidad' in URL (up to 60s)...")
         reached = _wait_for_url_contains(page, "selecciona-entidad", timeout=60)
@@ -242,8 +248,8 @@ def login_and_continue(page, post_click_wait: int = 5, wait_for_selector: Option
 
 # ---------------------------
 # Fill filters / Consult
-# ---------------------------
 # (UNCHANGED)
+# ---------------------------
 
 def _click_maybe_in_frames(page, selector, timeout=2000):
     try:
@@ -433,9 +439,8 @@ def fill_cfe_and_consult(
         raise
 
 # ---------------------------
-# Grid scanning / extraction
+# Grid scanning / extraction (unchanged helpers)
 # ---------------------------
-# _try_get_text and _extract_fields_from_page unchanged
 
 def _try_get_text(element):
     if element is None:
@@ -654,23 +659,309 @@ def _gather_candidate_link_elements(page, parent_selector=None, link_selector=No
     return candidates
 
 
-def collect_cfe_from_links(page, link_selector: Optional[str] = None, output_file: str = "results.xlsx", parent_selector: Optional[str]=None) -> str:
+# ---------------------------
+# NEW: click Next only (no re-fill)
+# ---------------------------
+def click_next_only(page) -> bool:
+    """
+    Find the in-grid 'Next' image/button and click it without re-running the filters.
+    Returns True if a click was performed, False otherwise.
+    """
+    candidates = [
+        'input#W0127SIGUIENTE',
+        'input[name="W0127SIGUIENTE"]',
+        'input.Image[id="W0127SIGUIENTE"]',
+        'input.Image[src*="K2BPageNext.png"]',
+        'input[src*="K2BPageNext.png"]',
+        'img[src*="K2BPageNext.png"]',
+        'button[title*="Sig"]',
+        'a[title*="Sig"]',
+        'button:has-text("Siguiente")',
+        'a:has-text("Siguiente")'
+    ]
+    clicked = False
+    for sel_q in candidates:
+        frame_or_page, el = _find_element_in_page_and_frames(page, sel_q, timeout=2500)
+        if el:
+            try:
+                print(f"[INFO] Found next-button by selector '{sel_q}', clicking (no fill)...")
+                try:
+                    el.click()
+                except Exception:
+                    el.evaluate("el => el.click()")
+                clicked = True
+                break
+            except Exception as e:
+                print("[WARN] Next-button click failed for selector", sel_q, e)
+                continue
+
+    if not clicked:
+        print("[WARN] Could not find/click the next image button (click_next_only).")
+        try:
+            _dump_debug(page, prefix="debug_next_button")
+        except Exception:
+            pass
+    return clicked
+
+
+# keep go_to_consulta_and_click_next for initial navigation if caller wants it,
+# but we will not call it during pagination (it previously re-ran fill).
+def go_to_consulta_and_click_next(page,
+                                 consulta_url: Optional[str] = "https://servicios.dgi.gub.uy/serviciosenlinea/con-clave/dgi--servicios-en-linea--otros-servicios--efactura-consulta-de-cfe-y-cfc-recibidos",
+                                 tipo_value: Optional[str] = None,
+                                 date_from: Optional[str] = None,
+                                 date_to: Optional[str] = None,
+                                 wait_after_fill: float = 2.0) -> Tuple[object, str]:
+    """
+    Navigate to consulta page (if needed), run fill_cfe_and_consult once to ensure grid is loaded,
+    then click the Next image/button and return (final_page, url).
+    This function is intended for one-off navigation/post-action, not for in-place pagination loops.
+    """
+    try:
+        try:
+            cur_url = getattr(page, "url", "") or ""
+        except Exception:
+            cur_url = ""
+        if consulta_url and consulta_url not in cur_url:
+            try:
+                print(f"[INFO] Navigating to consulta page: {consulta_url}")
+                page.goto(consulta_url, timeout=30000)
+                try:
+                    page.wait_for_load_state("load", timeout=20000)
+                except Exception:
+                    try:
+                        page.wait_for_load_state("networkidle", timeout=20000)
+                    except Exception:
+                        pass
+            except Exception as e:
+                print("[WARN] Navigation to consulta URL failed or timed out:", e)
+
+        tipo = tipo_value or getattr(config, "ECF_TIPO", "111")
+        d_from = date_from or getattr(config, "ECF_FROM_DATE", "")
+        d_to = date_to or getattr(config, "ECF_TO_DATE", "")
+
+        print(f"[INFO] fill_cfe_and_consult: tipo={tipo}, desde={d_from}, hasta={d_to}")
+        final_page, final_url = fill_cfe_and_consult(page, tipo_value=tipo, date_from=d_from, date_to=d_to, wait_after_result=0)
+
+        print(f"[INFO] Waiting {wait_after_fill} seconds before clicking next image...")
+        time.sleep(wait_after_fill)
+
+        clicked = click_next_only(final_page)
+        try:
+            final_page.wait_for_load_state("load", timeout=10000)
+        except Exception:
+            try:
+                final_page.wait_for_load_state("networkidle", timeout=10000)
+            except Exception:
+                pass
+
+        return final_page, getattr(final_page, "url", final_url)
+    except Exception as e:
+        print("[ERROR] go_to_consulta_and_click_next failed:", e)
+        traceback.print_exc()
+        try:
+            _dump_debug(page, prefix="debug_go_to_consulta_error")
+        except Exception:
+            pass
+        raise
+
+
+# ---------------------------
+# NEW helper: process current page and append rows to CSV/Excel
+# (improved to WAIT for new URLs that are not in `processed` after pagination click)
+# ---------------------------
+def process_and_save_current_page(page, processed: set, csv_path: str, cols_order: List[str],
+                                  parent_selector: Optional[str] = None, link_selector: Optional[str] = None,
+                                  wait_for_new_seconds: float = 6.0) -> int:
+    """
+    Process the current page: wait until the page grid yields new (unprocessed) URLs or
+    until wait_for_new_seconds timeout, then extract and append rows.
+
+    Returns number of new rows added.
+    """
+    start = time.time()
+    new_rows = 0
+
+    # Poll until we get candidate URLs or timeout
+    urls = []
+    while time.time() - start < wait_for_new_seconds:
+        try:
+            urls = _collect_candidate_urls(page, parent_selector=parent_selector, link_selector=link_selector)
+            # compute whether there are any urls that are not already processed
+            unprocessed = [u for u in urls if _canonicalize_url(u) not in processed]
+            if urls and unprocessed:
+                urls = urls  # proceed
+                break
+            # If nothing processed yet (first page), accept whatever we have
+            if not processed and urls:
+                break
+        except Exception:
+            pass
+        time.sleep(0.3)
+
+    if not urls:
+        # final attempt to collect fallback elements
+        try:
+            urls = _collect_candidate_urls(page, parent_selector=parent_selector, link_selector=link_selector)
+        except Exception:
+            urls = []
+
+    fallback_elements = []
+    if not urls:
+        try:
+            fallback_elements = _gather_candidate_link_elements(page, parent_selector=parent_selector, link_selector=link_selector)
+        except Exception:
+            fallback_elements = []
+
+    # Process URL list first
+    for idx, url in enumerate(urls, start=1):
+        canon = _canonicalize_url(url)
+        if canon in processed:
+            print(f"[INFO] URL already processed; skipping: {url}")
+            continue
+        print(f"[INFO] Opening URL {idx}/{len(urls)}: {url}")
+        try:
+            new_page = page.context.new_page()
+            try:
+                new_page.goto(url, timeout=30000)
+                try:
+                    new_page.wait_for_load_state("load", timeout=20000)
+                except Exception:
+                    try:
+                        new_page.wait_for_load_state("networkidle", timeout=20000)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+            extraction_target = new_page
+            try:
+                for f in getattr(new_page, 'frames', []):
+                    if f.query_selector('#span_vDENOMINACION') or f.query_selector('[id*="CTLEFACCFETOTALMONTOTOTAL"]'):
+                        extraction_target = f
+                        break
+            except Exception:
+                pass
+
+            data = _extract_fields_from_page(extraction_target)
+            data['_source_url'] = url
+
+            # ensure all columns exist
+            for c in cols_order:
+                if c not in data:
+                    data[c] = ''
+            try:
+                _append_row_to_csv(csv_path, data, fieldnames=cols_order)
+                processed.add(canon)
+                new_rows += 1
+                print(f"[INFO] Appended row for {url}")
+            except Exception as e:
+                print("[ERROR] Could not append row:", e)
+
+            try:
+                new_page.close()
+            except Exception:
+                pass
+        except Exception as e:
+            print("[ERROR] Error opening URL:", url, e)
+            try:
+                new_page.close()
+            except Exception:
+                pass
+            continue
+
+    # If URL list gave nothing or didn't yield new rows, process fallback element-clicks
+    if new_rows == 0 and fallback_elements:
+        print("[INFO] Attempting fallback element-click extraction on this page.")
+        for (frm, el) in fallback_elements:
+            try:
+                opened_page = None
+                try:
+                    with page.context.expect_page(timeout=3000) as new_page_ctx:
+                        el.click()
+                    opened_page = new_page_ctx.value
+                except Exception:
+                    try:
+                        el.click()
+                        time.sleep(0.5)
+                        opened_page = page
+                    except Exception:
+                        opened_page = None
+
+                if not opened_page:
+                    continue
+
+                extraction_target = opened_page
+                try:
+                    for f in getattr(opened_page, 'frames', []):
+                        if f.query_selector('#span_vDENOMINACION') or f.query_selector('[id*="CTLEFACCFETOTALMONTOTOTAL"]'):
+                            extraction_target = f
+                            break
+                except Exception:
+                    pass
+
+                data = _extract_fields_from_page(extraction_target)
+                src_url = getattr(opened_page, 'url', '') or ''
+                data['_source_url'] = src_url
+                canon = _canonicalize_url(src_url) if src_url else ''
+
+                if canon and canon in processed:
+                    print("[INFO] Fallback element led to already-processed page; skipping.")
+                else:
+                    for c in cols_order:
+                        if c not in data:
+                            data[c] = ''
+                    try:
+                        _append_row_to_csv(csv_path, data, fieldnames=cols_order)
+                        if canon:
+                            processed.add(canon)
+                        new_rows += 1
+                        print(f"[INFO] Appended fallback row (element-click path)")
+                    except Exception as e:
+                        print("[ERROR] Could not append fallback row:", e)
+
+                try:
+                    if opened_page is not page:
+                        opened_page.close()
+                except Exception:
+                    pass
+
+            except Exception as e:
+                print("[WARN] Exception during fallback element processing:", e)
+                continue
+
+    # Best-effort: update Excel after processing this page
+    try:
+        if os.path.exists(csv_path):
+            final_df = pd.read_csv(csv_path)
+            try:
+                xlsx_path = os.path.splitext(csv_path)[0] + ".xlsx"
+                final_df.to_excel(xlsx_path, index=False)
+                print(f"[INFO] Saved {len(final_df)} rows to {xlsx_path} (intermediate).")
+            except Exception as e:
+                print("[WARN] Could not save intermediate Excel:", e)
+    except Exception as e:
+        print("[WARN] Could not convert CSV to Excel / read CSV during intermediate save:", e)
+
+    return new_rows
+
+
+# ---------------------------
+# Updated collect_cfe_from_links: multi-page, uses click_next_only for in-place pagination
+# ---------------------------
+def collect_cfe_from_links(page, link_selector: Optional[str] = None, output_file: str = "results.xlsx", parent_selector: Optional[str]=None,
+                           do_post_action: bool = True, max_pages: Optional[int] = None) -> str:
     """
     Main function used by main.py: find document links in the grid (or using link_selector),
-    open each (by URL when possible), extract fields and save incrementally to CSV.
+    extract fields and save incrementally to CSV/Excel for each page, and paginate by clicking Next in-place.
     Returns output_file path on success (Excel if able to write, otherwise CSV).
     """
-    print("[INFO] Scanning page for link elements (collecting URLs first)...")
-    urls = _collect_candidate_urls(page, parent_selector=parent_selector, link_selector=link_selector)
-    print(f"[INFO] Collected {len(urls)} candidate URLs.")
-
-    # As fallback keep element handles if URLs couldn't be extracted for some entries
-    fallback_elements = _gather_candidate_link_elements(page, parent_selector=parent_selector, link_selector=link_selector)
-    print(f"[INFO] Found {len(fallback_elements)} candidate elements (fallback).")
+    print("[INFO] Starting collection (in-place pagination + immediate extraction).")
 
     out_dir = os.path.dirname(output_file) or "."
     base_name = os.path.splitext(os.path.basename(output_file))[0]
     csv_path = os.path.join(out_dir, f"{base_name}.csv")
+    xlsx_path = os.path.join(out_dir, f"{base_name}.xlsx")
 
     # load processed URLs from existing outputs (Excel or CSV)
     processed = set()
@@ -707,186 +998,80 @@ def collect_cfe_from_links(page, link_selector: Optional[str] = None, output_fil
         os.makedirs(out_dir, exist_ok=True)
 
     rows_added = 0
+    page_count = 0
 
-    # First: iterate over URLs (preferred)
-    for idx, url in enumerate(urls, start=1):
-        canon = _canonicalize_url(url)
-        if canon in processed:
-            print(f"[INFO] URL already processed; skipping: {url}")
-            continue
-        print(f"[INFO] Opening URL {idx}/{len(urls)}: {url}")
-        try:
-            new_page = page.context.new_page()
-            try:
-                new_page.goto(url, timeout=30000)
-                new_page.wait_for_load_state("load", timeout=20000)
-            except Exception:
-                try:
-                    new_page.wait_for_load_state("networkidle", timeout=20000)
-                except Exception:
-                    pass
+    # 1) Process current page first
+    page_count += 1
+    print(f"[INFO] Processing initial page (page {page_count}) ...")
+    new_on_page = process_and_save_current_page(page, processed, csv_path, cols_order, parent_selector=parent_selector, link_selector=link_selector)
+    rows_added += new_on_page
+    print(f"[INFO] New rows from initial page: {new_on_page}")
 
-            extraction_target = new_page
-            try:
-                for f in getattr(new_page, 'frames', []):
-                    if f.query_selector('#span_vDENOMINACION') or f.query_selector('[id*="CTLEFACCFETOTALMONTOTOTAL"]'):
-                        extraction_target = f
-                        break
-            except Exception:
-                pass
+    # 2) Loop: click Next (in-place) then immediately process that page
+    while True:
+        # decide whether to stop
+        if max_pages is not None and page_count >= max_pages:
+            print(f"[INFO] Reached max_pages limit ({max_pages}). Stopping pagination.")
+            break
+        if new_on_page == 0:
+            print("[INFO] No new items found on last processed page. Stopping pagination.")
+            break
 
-            data = _extract_fields_from_page(extraction_target)
-            data['_source_url'] = url
+        print("[INFO] Clicking Next to advance to next page (no fill) ...")
+        clicked = click_next_only(page)
+        if not clicked:
+            print("[WARN] Could not click Next — stopping pagination.")
+            break
 
-            # append to CSV
-            for c in cols_order:
-                if c not in data:
-                    data[c] = ''
-            try:
-                _append_row_to_csv(csv_path, data, fieldnames=cols_order)
-                processed.add(canon)
-                rows_added += 1
-                print(f"[INFO] Appended row {rows_added} for {url}")
-            except Exception as e:
-                print("[ERROR] Could not append row:", e)
+        # small grace before scraping — process_and_save_current_page will poll for new items
+        time.sleep(0.2)
 
-            try:
-                new_page.close()
-            except Exception:
-                pass
-        except Exception as e:
-            print("[ERROR] Error opening URL:", url, e)
-            try:
-                new_page.close()
-            except Exception:
-                pass
-            continue
+        page_count += 1
+        print(f"[INFO] Processing page {page_count} ...")
+        new_on_page = process_and_save_current_page(page, processed, csv_path, cols_order, parent_selector=parent_selector, link_selector=link_selector)
+        rows_added += new_on_page
+        print(f"[INFO] New rows from page {page_count}: {new_on_page}")
 
-    # Second: handle any fallback elements (those without hrefs) by clicking them one-by-one
-    for idx, (frame, element) in enumerate(fallback_elements, start=1):
-        # try to compute a stable identifier
-        try:
-            sig = element.evaluate("el => el.outerHTML.substring(0,200)")
-        except Exception:
-            sig = str(element)
-        # Re-check if this signature already processed by comparing to processed URLs
-        print(f"[INFO] Processing fallback element {idx}/{len(fallback_elements)}")
-        is_new_tab = False
-        final_page = page
-        try:
-            with page.context.expect_page(timeout=8000) as new_page_ctx:
-                try:
-                    element.click(timeout=5000)
-                except Exception:
-                    try:
-                        element.evaluate("el => el.click()")
-                    except Exception as e:
-                        print("[ERROR] Could not click fallback element:", e)
-                        continue
-            new_page = new_page_ctx.value
-            try:
-                new_page.wait_for_load_state("load", timeout=15000)
-            except Exception:
-                try:
-                    new_page.wait_for_load_state("networkidle", timeout=15000)
-                except Exception:
-                    pass
-            final_page = new_page
-            is_new_tab = True
-            print(f"[INFO] Opened new tab for fallback element: {getattr(final_page,'url','<unknown>')}")
-        except TimeoutError:
-            try:
-                element.click(timeout=5000)
-            except Exception:
-                try:
-                    element.evaluate("el => el.click()")
-                except Exception as e:
-                    print("[WARN] fallback click failed (same page):", e)
-            try:
-                if hasattr(frame, 'wait_for_load_state'):
-                    frame.wait_for_load_state('load', timeout=8000)
-                page.wait_for_load_state('load', timeout=8000)
-            except Exception:
-                try:
-                    page.wait_for_load_state('networkidle', timeout=8000)
-                except Exception:
-                    pass
-            final_page = page
-            print('[INFO] Click triggered same-page change for fallback element.')
+        # loop continues and will break if new_on_page==0 or max_pages reached
 
-        try:
-            extraction_target = final_page
-            try:
-                for f in getattr(final_page, 'frames', []):
-                    if f.query_selector('#span_vDENOMINACION') or f.query_selector('[id*="CTLEFACCFETOTALMONTOTOTAL"]'):
-                        extraction_target = f
-                        break
-            except Exception:
-                pass
-
-            data = _extract_fields_from_page(extraction_target)
-            try:
-                data['_source_url'] = final_page.url
-            except Exception:
-                data['_source_url'] = ''
-
-            canon_url = _canonicalize_url(data.get('_source_url',''))
-            if canon_url and canon_url in processed:
-                print('[INFO] Fallback target already processed; skipping:', data.get('_source_url'))
-            else:
-                for c in cols_order:
-                    if c not in data:
-                        data[c] = ''
-                _append_row_to_csv(csv_path, data, fieldnames=cols_order)
-                if canon_url:
-                    processed.add(canon_url)
-                rows_added += 1
-                print(f"[INFO] Appended fallback row {rows_added}")
-        except Exception as e:
-            print('[ERROR] Extraction for fallback element failed:', e)
-
-        # cleanup
-        try:
-            if is_new_tab and final_page is not None:
-                try:
-                    final_page.close()
-                except Exception:
-                    pass
-                try:
-                    page.wait_for_load_state('load', timeout=2000)
-                except Exception:
-                    pass
-            else:
-                try:
-                    page.go_back()
-                    page.wait_for_load_state('load', timeout=5000)
-                except Exception:
-                    try:
-                        page.reload()
-                        page.wait_for_load_state('load', timeout=5000)
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-
-    # Try to write final Excel from CSV
+    # Final: try to write final Excel from CSV
     try:
-        final_df = pd.read_csv(csv_path)
+        final_df = pd.read_csv(csv_path) if os.path.exists(csv_path) else pd.DataFrame(columns=cols_order)
         try:
-            final_df.to_excel(output_file, index=False)
-            print(f"[SUCCESS] Saved {len(final_df)} rows to {output_file}")
-            return output_file
+            final_df.to_excel(xlsx_path, index=False)
+            print(f"[SUCCESS] Saved {len(final_df)} rows to {xlsx_path}")
+            result_path = xlsx_path
         except PermissionError as pe:
             ts_path = os.path.join(out_dir, f"{base_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx")
             try:
                 final_df.to_excel(ts_path, index=False)
-                print(f"[WARN] Could not overwrite {output_file} (Permission denied). Saved Excel to {ts_path} instead.")
-                return ts_path
+                print(f"[WARN] Could not overwrite {xlsx_path} (Permission denied). Saved Excel to {ts_path} instead.")
+                result_path = ts_path
             except Exception as e:
                 print("[ERROR] Could not save Excel fallback:", e)
                 print("[INFO] Leaving incremental CSV at:", csv_path)
-                return csv_path
+                result_path = csv_path
     except Exception as e:
         print("[ERROR] Could not convert CSV to Excel / read CSV:", e)
         print("[INFO] Leaving incremental CSV at:", csv_path)
-        return csv_path
+        result_path = csv_path
+
+    # ---- After finishing collection, optionally navigate back to consulta and refill the same details ----
+    if do_post_action:
+        try:
+            try:
+                tipo = getattr(config, "ECF_TIPO", None)
+                d_from = getattr(config, "ECF_FROM_DATE", None)
+                d_to = getattr(config, "ECF_TO_DATE", None)
+            except Exception:
+                tipo = d_from = d_to = None
+
+            print("[INFO] Performing post-collection action: navigate to consulta and refill filters + click next image...")
+            try:
+                go_to_consulta_and_click_next(page, tipo_value=tipo, date_from=d_from, date_to=d_to, wait_after_fill=2.0)
+            except Exception as e:
+                print("[WARN] Post-collection navigation/click failed:", e)
+        except Exception:
+            pass
+
+    return result_path
